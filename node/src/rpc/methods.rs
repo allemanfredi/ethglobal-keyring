@@ -54,6 +54,8 @@ impl RpcServer for Methods {
         operation: Operation,
         operation_signature: String,
     ) -> Result<SignResponse, ErrorObjectOwned> {
-        return Ok(SignResponse { signature: "1".to_string() });
+        return Ok(SignResponse {
+            signature: "1".to_string(),
+        });
     }
 }

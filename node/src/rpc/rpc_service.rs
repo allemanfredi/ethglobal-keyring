@@ -15,9 +15,7 @@ pub struct RpcService {
 
 impl RpcService {
     pub fn new(listen_addr: String) -> Self {
-        RpcService {
-            listen_addr,
-        }
+        RpcService { listen_addr }
     }
 
     pub async fn start(&self) -> anyhow::Result<SocketAddr> {
