@@ -1,6 +1,8 @@
 use futures::{self, channel::oneshot};
 use serde::{Deserialize, Serialize};
 
+use crate::mpc::mpc_service::MpcServiceError;
+
 #[derive(Serialize, Deserialize)]
 pub enum EventCommands {
     NewEvent { data: Vec<u8> },
@@ -8,11 +10,12 @@ pub enum EventCommands {
 
 pub enum RpcCommands {
     StartGenerateKey {
-        response_tx: oneshot::Sender<String>,
+        response_tx: oneshot::Sender<Result<String, MpcServiceError>>,
     },
     StartSigning {
-        response_tx: oneshot::Sender<String>,
+        response_tx: oneshot::Sender<Result<String, MpcServiceError>>,
         shared_public_key: String, // hex encoded
+        data: Vec<u8>,
     },
 }
 
@@ -27,6 +30,7 @@ pub enum ProtocolEvents {
     JoinSigning {
         eid: String,
         shared_public_key: String,
+        data: Vec<u8>,
     },
     Cggmp21CoreAuxInfoGen {
         eid: String,
