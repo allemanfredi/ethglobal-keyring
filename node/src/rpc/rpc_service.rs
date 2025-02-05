@@ -11,11 +11,15 @@ use crate::{
 
 pub struct RpcService {
     listen_addr: String,
+    rpc_channel_tx: mpsc::UnboundedSender<RpcCommands>,
 }
 
 impl RpcService {
-    pub fn new(listen_addr: String) -> Self {
-        RpcService { listen_addr }
+    pub fn new(listen_addr: String, rpc_channel_tx: mpsc::UnboundedSender<RpcCommands>) -> Self {
+        RpcService {
+            listen_addr,
+            rpc_channel_tx,
+        }
     }
 
     pub async fn start(&self) -> anyhow::Result<SocketAddr> {
@@ -31,7 +35,9 @@ impl RpcService {
             .await?;
 
         let addr = server.local_addr()?;
-        let methods = Methods {};
+        let methods = Methods {
+            rpc_channel_tx: self.rpc_channel_tx.clone(),
+        };
         let handle = server.start(methods.into_rpc());
 
         tokio::spawn(handle.stopped());

@@ -3,7 +3,10 @@ use serde::Deserialize;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GenerateKeyResponse {
-    pub id: String,
+    #[serde(rename = "sharedPublicKey")]
+    pub shared_public_key: String,
+    #[serde(rename = "sharedEvmAddress")]
+    pub shared_evm_address: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
