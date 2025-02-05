@@ -1,0 +1,244 @@
+use anyhow::Result;
+use cggmp21::{
+    key_refresh::AuxOnlyMsg,
+    key_share::{DirtyAuxInfo, DirtyKeyShare, Valid},
+    keygen::msg::threshold::Msg as KeygenMsg,
+    round_based::{Incoming, MessageType},
+    security_level::SecurityLevel128,
+    signing::msg::Msg as SigningMessage,
+    supported_curves::Secp256k1,
+    PregeneratedPrimes,
+};
+use futures::{
+    channel::{
+        mpsc::{self, UnboundedSender},
+        oneshot::{self, Sender},
+    },
+    lock::Mutex,
+    StreamExt,
+};
+use k256::sha2::Sha256;
+use rand::RngCore;
+use rand_core::OsRng;
+use std::{collections::HashMap, sync::Arc};
+
+use crate::types::channels::{EventCommands, NetworkCommands, ProtocolEvents, RpcCommands};
+
+use super::aux_info_gen::{run_aux_info_gen, AuxInfoGenErrors};
+
+lazy_static! {
+    static ref DB: Mutex<HashMap<String, Valid<DirtyKeyShare<Secp256k1, SecurityLevel128>>>> =
+        Mutex::new(HashMap::new());
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MpcServiceError {
+    #[error("failed to get the local signer id")]
+    GetLocalSignerIdError,
+
+    #[error("failed to get key share for shared_public_key={0}")]
+    KeyShareNotFound(String),
+}
+
+pub struct MpcService {
+    rpc_channel_rx: mpsc::UnboundedReceiver<RpcCommands>,
+    network_channel_tx: mpsc::UnboundedSender<NetworkCommands>,
+    network_channel_rx: mpsc::UnboundedReceiver<NetworkCommands>,
+    protocol_event_channel_rx: mpsc::UnboundedReceiver<EventCommands>,
+    active_channels_aux_info_gen: Arc<
+        Mutex<
+            HashMap<
+                String,
+                UnboundedSender<
+                    Result<Incoming<AuxOnlyMsg<Sha256, SecurityLevel128>>, AuxInfoGenErrors>,
+                >,
+            >,
+        >,
+    >,
+    pregenerated_primes: PregeneratedPrimes,
+    aux_info: Arc<Mutex<Option<Valid<DirtyAuxInfo>>>>,
+}
+
+impl MpcService {
+    pub fn new(
+        rpc_channel_rx: mpsc::UnboundedReceiver<RpcCommands>,
+        network_channel_tx: mpsc::UnboundedSender<NetworkCommands>,
+        network_channel_rx: mpsc::UnboundedReceiver<NetworkCommands>,
+        protocol_event_channel_rx: mpsc::UnboundedReceiver<EventCommands>,
+        pregenerated_primes: PregeneratedPrimes,
+    ) -> Self {
+        MpcService {
+            rpc_channel_rx,
+            network_channel_tx,
+            network_channel_rx,
+            protocol_event_channel_rx,
+            active_channels_aux_info_gen: Arc::new(Mutex::new(HashMap::new())),
+            pregenerated_primes,
+            aux_info: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub async fn start(&mut self) {
+        loop {
+            tokio::select! {
+                // Handle messages from network service
+                cmd = self.network_channel_rx.next() => {
+                    match cmd {
+                        Some(NetworkCommands::AllPeersJoined) => {
+                            let local_signer_id =  self.get_local_signer_id().await.unwrap();
+                            let eid = MpcService::generate_eid();
+                            // NOTE: for now the signer with index = 0 is the one in charge of starting the auxiliary info generation
+                            // NOTE: Considering in the initial phase the number of signers is fixed, we can generate the primes only once.
+                            // check here: https://github.com/LFDT-Lockness/cggmp21/tree/5e621acd25aa492941ef9c4491a1c7aa16a39807?tab=readme-ov-file#on-reusability-of-the-auxiliary-data
+                            if local_signer_id == 0 {
+                                tracing::info!("starting generating auxiliary info with signer_id={local_signer_id} for eid={eid} ...");
+                                self.run_aux_info_gen(eid, true).await;
+                            }
+                        },
+                        _ => {
+                            tracing::error!("received an invalid network command");
+                        },
+                    }
+                },
+                // Handle messages from network service
+                cmd = self.protocol_event_channel_rx.next() => {
+                    if let Some(EventCommands::NewEvent { data }) = cmd {
+                        match bincode::deserialize(&data) {
+                            Ok(ProtocolEvents::JoinAuxInfoGen { eid}) => {
+                                tracing::info!("joining auxiliary info generation with signer_id={} for eid={eid} ...", self.get_local_signer_id().await.unwrap());
+                                self.run_aux_info_gen(eid, false).await;
+                            },
+                            Ok(ProtocolEvents::JoinKeyGen { eid }) => {
+                                tracing::info!("joining key generation with signer_id={} for eid={eid} ...", self.get_local_signer_id().await.unwrap());
+                                // TODO
+                            },
+                            Ok(ProtocolEvents::JoinSigning { eid, shared_public_key, data }) => {
+                                tracing::info!("joining signing data={} with signer_id={} for eid={eid} and shared_public_key={shared_public_key} ...", hex::encode(&data), self.get_local_signer_id().await.unwrap());
+                               // TODO
+                            },
+                            Ok(ProtocolEvents::Cggmp21CoreAuxInfoGen { eid, message_id, data, signer_id, receiver_signer_id }) => {
+                                let local_signer_id= self.get_local_signer_id().await.unwrap();
+                                let msg_type = if let Some(to_signer_id) = receiver_signer_id {
+                                    // TODO: be sure that the node knows the receiver_signer_id
+                                    if to_signer_id != local_signer_id {
+                                        continue;
+                                    }
+                                    MessageType::P2P
+                                } else {
+                                    MessageType::Broadcast
+                                };
+
+                                let active_channels_aux_info_gen_locked = self.active_channels_aux_info_gen.lock().await;
+                                let tx = active_channels_aux_info_gen_locked.get(&eid).unwrap();
+
+                                let incoming = Incoming {
+                                    id: message_id,
+                                    sender: signer_id,
+                                    msg_type,
+                                    msg: bincode::deserialize::<AuxOnlyMsg<Sha256, SecurityLevel128>>(&data).unwrap()
+                                };
+
+                                tx.unbounded_send(Ok(incoming))
+                                .unwrap_or_else(|err| {
+                                    tracing::error!("failed to send the message into the cggmp21 mpc stream: {err}");
+                                });
+                            },
+                            Ok(ProtocolEvents::Cggmp21CoreKeygen { eid, message_id, data, signer_id, receiver_signer_id }) => {
+                                // TODO
+                            },
+                            Ok(ProtocolEvents::Cggmp21CoreSigning { eid, message_id, data, signer_id, receiver_signer_id }) => {
+                                // TODO
+                            },
+                            Err(err) => {
+                                tracing::error!("failed to deserialize the protocol event {}. Reason: {err}", hex::encode(data));
+                            }
+                        }
+
+                    } else {
+                        tracing::error!("Unknown event");
+                    }
+
+                },
+                // Handle messages from rpc service
+                cmd = self.rpc_channel_rx.next() => {
+                    match cmd {
+                        Some(RpcCommands::StartGenerateKey { response_tx }) => {
+                            let eid = MpcService::generate_eid();
+                            tracing::info!("starting generating key with signer_id={} for eid={eid} ...",  self.get_local_signer_id().await.unwrap());
+                            // TODO
+                        },
+                        Some(RpcCommands::StartSigning { response_tx, shared_public_key, data }) => {
+                            let eid = MpcService::generate_eid();
+                            tracing::info!("starting signing data={} with signer_id={} for eid={eid} and shared_public_key={shared_public_key} ...", hex::encode(&data),  self.get_local_signer_id().await.unwrap());
+                            // TODO
+                        },
+                        None => {
+                            tracing::error!("invalid rpc command");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn get_local_signer_id(&self) -> Result<u16> {
+        let (tx, rx) = oneshot::channel();
+        self.network_channel_tx
+            .unbounded_send(NetworkCommands::GetLocalSignerId { response_tx: tx })
+            .unwrap();
+        let signer_id = match rx.await {
+            Ok(signer_id) => signer_id,
+            Err(_) => {
+                tracing::error!("failed to retrieve the signer_id");
+                return Err(MpcServiceError::GetLocalSignerIdError.into());
+            }
+        };
+        Ok(signer_id)
+    }
+
+    async fn run_aux_info_gen(&mut self, eid: String, send_join_aux_info_gen_event: bool) {
+        let pregenerated_primes = self.pregenerated_primes.clone();
+        let network_channel_tx = self.network_channel_tx.clone();
+        let active_channels_aux_info_gen = Arc::clone(&self.active_channels_aux_info_gen);
+        let local_signer_id = self.get_local_signer_id().await.unwrap();
+
+        // NOTE: we need to create a channel to receive the aux info and store them as we need them for key generation
+        let (response_tx, response_rx) = oneshot::channel::<String>(); // Valid<DirtyAuxInfo> doesn't implement debug so it doesn't work
+        let aux_info_mutex = Arc::clone(&self.aux_info);
+        tokio::spawn(async move {
+            match response_rx.await {
+                Ok(res) => {
+                    let mut aux_info = aux_info_mutex.lock().await;
+                    *aux_info = Some(serde_json::from_str::<Valid<DirtyAuxInfo>>(&res).unwrap());
+                    // Valid<DirtyAuxInfo> doesn't implement debug so it doesn't work
+                }
+                Err(_) => {
+                    tracing::error!("failed to retrieve the auxiliary info");
+                    // TODO: handle better errors
+                    panic!("failed to retrieve the auxiliary info");
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            let tx_0 = run_aux_info_gen(
+                network_channel_tx,
+                response_tx,
+                send_join_aux_info_gen_event,
+                local_signer_id,
+                eid.clone(),
+                pregenerated_primes,
+            )
+            .await
+            .unwrap();
+            let mut map_guard = active_channels_aux_info_gen.lock().await;
+            map_guard.insert(eid, tx_0);
+        });
+    }
+
+    fn generate_eid() -> String {
+        let mut random_bytes = [0u8; 32];
+        OsRng.fill_bytes(&mut random_bytes);
+        hex::encode(random_bytes)
+    }
+}
