@@ -1,11 +1,12 @@
 use anyhow::Result;
 use cggmp21::{
-    key_refresh::AuxOnlyMsg as Msg,
     key_share::{DirtyAuxInfo, Valid},
+    keygen::msg::threshold::Msg,
     progress::PerfProfiler,
     round_based::{Incoming, MessageDestination, MpcParty, Outgoing},
     security_level::SecurityLevel128,
-    PregeneratedPrimes,
+    supported_curves::Secp256k1,
+    KeygenError as CGGMP21KeygenError,
 };
 use futures::{
     channel::{
@@ -21,24 +22,28 @@ use rand_core::OsRng;
 use crate::types::channels::{NetworkCommands, ProtocolEvents};
 
 #[derive(Debug, thiserror::Error)]
-pub enum AuxInfoGenError {}
+pub enum KeygenError {}
 
-pub async fn run_aux_info_gen(
+pub async fn run_keygen(
     network_channel_tx: mpsc::UnboundedSender<NetworkCommands>,
-    response_tx: oneshot::Sender<String>, // Valid<DirtyAuxInfo> doesn't implement Debug
-    send_join_aux_info_gen_event: bool,
-    local_signer_id: u16,
+    response_tx: oneshot::Sender<String>, // oneshot::Sender<Valid<DirtyKeyShare<Secp256k1, SecurityLevel128>>> doesn't implement Debug ,
+    send_join_keygen_event: bool,
     eid: String,
-    pregenerated_primes: PregeneratedPrimes,
-) -> Result<UnboundedSender<Result<Incoming<Msg<Sha256, SecurityLevel128>>, AuxInfoGenError>>> {
-    let (tx_0, rx_0) =
-        mpsc::unbounded::<Result<Incoming<Msg<Sha256, SecurityLevel128>>, AuxInfoGenError>>();
-    let (tx_1, mut rx_1) = mpsc::unbounded::<Outgoing<Msg<Sha256, SecurityLevel128>>>();
+    local_signer_id: u16,
+    aux_info: Valid<DirtyAuxInfo>,
+    number_of_participants: u16,
+    threshold: u16,
+) -> Result<UnboundedSender<Result<Incoming<Msg<Secp256k1, SecurityLevel128, Sha256>>, KeygenError>>>
+{
+    let (tx_0, rx_0) = mpsc::unbounded::<
+        Result<Incoming<Msg<Secp256k1, SecurityLevel128, Sha256>>, KeygenError>,
+    >();
+    let (tx_1, mut rx_1) = mpsc::unbounded::<Outgoing<Msg<Secp256k1, SecurityLevel128, Sha256>>>();
     let party = MpcParty::connected((rx_0, tx_1));
 
-    if send_join_aux_info_gen_event {
-        // NOTE: trigger node-keyring to call .aux_info_gen()
-        let event = ProtocolEvents::JoinAuxInfoGen { eid: eid.clone() };
+    if send_join_keygen_event {
+        // NOTE: trigger node-keyring to call .set_threshold().start()
+        let event = ProtocolEvents::JoinKeyGen { eid: eid.clone() };
         let event_bytes = bincode::serialize(&event).unwrap();
         network_channel_tx
             .unbounded_send(NetworkCommands::Send { data: event_bytes })
@@ -46,15 +51,15 @@ pub async fn run_aux_info_gen(
     }
 
     // NOTE: forward messages to swarm
-    let eid_clone_for_aux_info_gen = eid.clone();
+    let eid_clone_for_keygen = eid.clone();
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 outgoing = rx_1.next() => {
                     match outgoing {
                         Some(outgoing) => {
-                            let event = ProtocolEvents::Cggmp21CoreAuxInfoGen {
-                                eid: eid.clone(),
+                            let event = ProtocolEvents::Cggmp21CoreKeygen {
+                                eid:eid.clone(),
                                 message_id: OsRng.gen::<u64>(),
                                 data: bincode::serialize(&outgoing.msg).unwrap(),
                                 signer_id: local_signer_id,
@@ -63,8 +68,7 @@ pub async fn run_aux_info_gen(
                                     _ => None,
                                 }
                             };
-                            let event_bytes = bincode::serialize(&event).unwrap();
-                            network_channel_tx.unbounded_send(NetworkCommands::Send { data: event_bytes }).unwrap();
+                            network_channel_tx.unbounded_send(NetworkCommands::Send { data: bincode::serialize(&event).unwrap() }).unwrap();
                         },
                         None => {
                             break;
@@ -78,28 +82,32 @@ pub async fn run_aux_info_gen(
 
     tokio::spawn(async move {
         let mut tracer = PerfProfiler::new();
-        let signer_id = local_signer_id;
-        let number_of_participants = 3;
-
-        match cggmp21::aux_info_gen(
-            cggmp21::ExecutionId::new(eid_clone_for_aux_info_gen.as_bytes()),
+        let signer_id: u16 = local_signer_id;
+        match cggmp21::keygen::KeygenBuilder::new(
+            cggmp21::ExecutionId::new(eid_clone_for_keygen.as_bytes()),
             signer_id,
             number_of_participants,
-            pregenerated_primes,
         )
         .set_progress_tracer(&mut tracer)
+        .set_threshold(threshold)
         .start(&mut OsRng, party)
         .await
         {
-            Ok(aux_info) => {
-                tracing::info!("succesfully generated the auxiliary info with signer_id={signer_id} for eid={eid_clone_for_aux_info_gen}");
-                response_tx
-                    .send(serde_json::to_string(&aux_info).unwrap())
-                    .unwrap();
+            Ok(incomplete_key_share) => {
+                let key_share =
+                    cggmp21::KeyShare::from_parts((incomplete_key_share, aux_info)).unwrap();
+
+                tracing::info!(
+                    "succesfully generate the keyshare with signer_id={signer_id} for eid={eid_clone_for_keygen}"
+                );
+
+                let serialized_key_share = serde_json::to_string(&key_share).unwrap();
+                tracing::debug!("{:?}", serialized_key_share);
+                response_tx.send(serialized_key_share).unwrap();
             }
             Err(err) => {
                 // TODO: send back the error
-                tracing::error!("failed to generate the auxiliary info. reason: {err}");
+                tracing::error!("error during key generation. reason: {err}");
                 handle.abort();
             }
         }

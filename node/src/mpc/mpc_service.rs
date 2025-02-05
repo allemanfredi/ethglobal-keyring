@@ -24,7 +24,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::types::channels::{EventCommands, NetworkCommands, ProtocolEvents, RpcCommands};
 
-use super::aux_info_gen::{run_aux_info_gen, AuxInfoGenErrors};
+use super::{
+    aux_info_gen::{run_aux_info_gen, AuxInfoGenError},
+    keygen::{run_keygen, KeygenError},
+};
 
 lazy_static! {
     static ref DB: Mutex<HashMap<String, Valid<DirtyKeyShare<Secp256k1, SecurityLevel128>>>> =
@@ -50,7 +53,17 @@ pub struct MpcService {
             HashMap<
                 String,
                 UnboundedSender<
-                    Result<Incoming<AuxOnlyMsg<Sha256, SecurityLevel128>>, AuxInfoGenErrors>,
+                    Result<Incoming<AuxOnlyMsg<Sha256, SecurityLevel128>>, AuxInfoGenError>,
+                >,
+            >,
+        >,
+    >,
+    active_channels_keygen: Arc<
+        Mutex<
+            HashMap<
+                String,
+                UnboundedSender<
+                    Result<Incoming<KeygenMsg<Secp256k1, SecurityLevel128, Sha256>>, KeygenError>,
                 >,
             >,
         >,
@@ -72,6 +85,7 @@ impl MpcService {
             network_channel_tx,
             network_channel_rx,
             protocol_event_channel_rx,
+            active_channels_keygen: Arc::new(Mutex::new(HashMap::new())),
             active_channels_aux_info_gen: Arc::new(Mutex::new(HashMap::new())),
             pregenerated_primes,
             aux_info: Arc::new(Mutex::new(None)),
@@ -110,7 +124,7 @@ impl MpcService {
                             },
                             Ok(ProtocolEvents::JoinKeyGen { eid }) => {
                                 tracing::info!("joining key generation with signer_id={} for eid={eid} ...", self.get_local_signer_id().await.unwrap());
-                                // TODO
+                                self.run_keygen(eid, false, None).await;
                             },
                             Ok(ProtocolEvents::JoinSigning { eid, shared_public_key, data }) => {
                                 tracing::info!("joining signing data={} with signer_id={} for eid={eid} and shared_public_key={shared_public_key} ...", hex::encode(&data), self.get_local_signer_id().await.unwrap());
@@ -144,7 +158,30 @@ impl MpcService {
                                 });
                             },
                             Ok(ProtocolEvents::Cggmp21CoreKeygen { eid, message_id, data, signer_id, receiver_signer_id }) => {
-                                // TODO
+                                let local_signer_id= self.get_local_signer_id().await.unwrap();
+                                let msg_type = if let Some(to_signer_id) = receiver_signer_id {
+                                    // TODO: be sure that the node knows the receiver_signer_id
+                                    if to_signer_id != local_signer_id {
+                                        continue;
+                                    }
+                                    MessageType::P2P
+                                } else {
+                                    MessageType::Broadcast
+                                };
+
+                                let active_channels_keygen_locked = self.active_channels_keygen.lock().await;
+                                let tx = active_channels_keygen_locked.get(&eid).unwrap();
+
+                                let incoming = Incoming {
+                                    id: message_id,
+                                    sender: signer_id,
+                                    msg_type,
+                                    msg: bincode::deserialize::<KeygenMsg<Secp256k1, SecurityLevel128, Sha256>>(&data).unwrap()
+                                };
+                                tx.unbounded_send(Ok(incoming))
+                                .unwrap_or_else(|err| {
+                                    tracing::error!("failed to send the message into the cggmp21 mpc stream: {err}");
+                                });
                             },
                             Ok(ProtocolEvents::Cggmp21CoreSigning { eid, message_id, data, signer_id, receiver_signer_id }) => {
                                 // TODO
@@ -165,7 +202,7 @@ impl MpcService {
                         Some(RpcCommands::StartGenerateKey { response_tx }) => {
                             let eid = MpcService::generate_eid();
                             tracing::info!("starting generating key with signer_id={} for eid={eid} ...",  self.get_local_signer_id().await.unwrap());
-                            // TODO
+                            self.run_keygen(eid.clone(), true, Some(response_tx)).await;
                         },
                         Some(RpcCommands::StartSigning { response_tx, shared_public_key, data }) => {
                             let eid = MpcService::generate_eid();
@@ -233,6 +270,65 @@ impl MpcService {
             .unwrap();
             let mut map_guard = active_channels_aux_info_gen.lock().await;
             map_guard.insert(eid, tx_0);
+        });
+    }
+
+    pub async fn run_keygen(
+        &mut self,
+        eid: String,
+        send_join_keygen_event: bool,
+        rpc_response_tx: Option<Sender<Result<String, MpcServiceError>>>,
+    ) {
+        let network_channel_tx = self.network_channel_tx.clone();
+        let active_channels_keygen = Arc::clone(&self.active_channels_keygen);
+        let local_signer_id = self.get_local_signer_id().await.unwrap();
+        let aux_info_mutex = Arc::clone(&self.aux_info);
+        let (response_tx, response_rx) = oneshot::channel::<String>(); // Valid<DirtyAuxInfo> doesn't implement debug so it doesn't work
+
+        tokio::spawn(async move {
+            if let Some(aux_info) = aux_info_mutex.lock().await.as_ref() {
+                let tx_0 = run_keygen(
+                    network_channel_tx,
+                    response_tx,
+                    send_join_keygen_event,
+                    eid.clone(),
+                    local_signer_id,
+                    aux_info.clone(),
+                    3, // FIXME: read it on chain from the contract that handle registrations
+                    3, // FIXME: must be equal to the number of participants
+                )
+                .await
+                .unwrap();
+                let mut map_guard = active_channels_keygen.lock().await;
+                map_guard.insert(eid, tx_0);
+            } else {
+                tracing::error!("failed to retrieve the auxiliary info whithin key generation")
+            }
+        });
+
+        tokio::spawn(async move {
+            match response_rx.await {
+                Ok(serialized_key_share) => {
+                    let key_share = serde_json::from_str::<
+                        Valid<DirtyKeyShare<Secp256k1, SecurityLevel128>>,
+                    >(&serialized_key_share)
+                    .unwrap();
+
+                    let shared_public_key =
+                        hex::encode(key_share.shared_public_key.to_bytes(true).to_vec());
+
+                    // TODO: store result
+                    DB.lock().await.insert(shared_public_key.clone(), key_share);
+
+                    // NOTE: if run_keygen has been called from RPC, we need to return the result
+                    if let Some(rpc_response_tx) = rpc_response_tx {
+                        rpc_response_tx.send(Ok(shared_public_key)).unwrap();
+                    }
+                }
+                Err(_) => {
+                    tracing::error!("failed to read keygen result");
+                }
+            }
         });
     }
 
