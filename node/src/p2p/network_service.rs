@@ -29,13 +29,25 @@ struct KeyringBehavior {
 pub struct NetworkService {
     listen_addr: String,
     peers_multi_addr: Vec<String>,
+    network_channel_tx: mpsc::UnboundedSender<NetworkCommands>,
+    network_channel_rx: mpsc::UnboundedReceiver<NetworkCommands>,
+    protocol_event_channel_tx: mpsc::UnboundedSender<EventCommands>,
 }
 
 impl NetworkService {
-    pub fn new(listen_addr: String, peers_multi_addr: Vec<String>) -> Self {
+    pub fn new(
+        listen_addr: String,
+        peers_multi_addr: Vec<String>,
+        network_channel_tx: mpsc::UnboundedSender<NetworkCommands>,
+        network_channel_rx: mpsc::UnboundedReceiver<NetworkCommands>,
+        protocol_event_channel_tx: mpsc::UnboundedSender<EventCommands>,
+    ) -> Self {
         NetworkService {
             listen_addr,
             peers_multi_addr,
+            network_channel_tx,
+            network_channel_rx,
+            protocol_event_channel_tx,
         }
     }
 
@@ -80,7 +92,10 @@ impl NetworkService {
                             request_response::Message::Request {
                                 request, channel, ..
                             } => {
-                              // TODO:
+                               self.protocol_event_channel_tx.unbounded_send(EventCommands::NewEvent { data: request.0 }).unwrap();
+                               self.protocol_event_channel_tx.flush().await.unwrap();
+                               // NOTE: send an empty response
+                               //swarm.behaviour_mut().request_response.send_response(channel, Response(vec![])).unwrap();
 
                             }
                             request_response::Message::Response {
@@ -102,7 +117,7 @@ impl NetworkService {
                                 // NOTE: When all peers join the network during the bootstrap phase
                                 // we have to notify the mpc service which will start the auxiliary info generation
                                 if peers_manager.get_total_number_of_peers() == 3 {
-                                    // TODO: all peers joined
+                                    self.network_channel_tx.unbounded_send(NetworkCommands::AllPeersJoined).unwrap();
                                 }
                             } else {
                                 tracing::info!("{peer_id} already connected. skipping it ...");
@@ -110,6 +125,33 @@ impl NetworkService {
 
                         }
                         _ => {}
+                    }
+                },
+                // Handle messages from rpc service
+                cmd = self.network_channel_rx.next() => {
+                    if let Some(cmd) = cmd {
+                        match cmd {
+                            NetworkCommands::Send { data } => {
+                                // TODO: send only to specific sender
+                                let peers_ids = peers_manager.peers();
+                                for peer_id in peers_ids {
+                                    if peer_id != *swarm.local_peer_id() {
+                                        swarm.behaviour_mut().request_response.send_request(&peer_id, Request(data.clone()));
+                                    }
+                                }
+                            }
+                            NetworkCommands::GetLocalSignerId { response_tx } => {
+                                // TODO: check that all peers are connected or that at least the node knows them
+                                // in order to assign properly the rank which will be used as signer id
+                                let signer_id = peers_manager
+                                    .signer_id_of(*swarm.local_peer_id()).unwrap();
+
+                                response_tx.send(signer_id).unwrap();
+                            },
+                            _ => {
+                                tracing::info!("received an invalid network command");
+                            }
+                        }
                     }
                 }
             }
