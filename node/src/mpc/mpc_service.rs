@@ -27,6 +27,7 @@ use crate::types::channels::{EventCommands, NetworkCommands, ProtocolEvents, Rpc
 use super::{
     aux_info_gen::{run_aux_info_gen, AuxInfoGenError},
     keygen::{run_keygen, KeygenError},
+    signing::{run_signing, SigningErrors},
 };
 
 lazy_static! {
@@ -68,6 +69,14 @@ pub struct MpcService {
             >,
         >,
     >,
+    active_channels_signing: Arc<
+        Mutex<
+            HashMap<
+                String,
+                UnboundedSender<Result<Incoming<SigningMessage<Secp256k1, Sha256>>, SigningErrors>>,
+            >,
+        >,
+    >,
     pregenerated_primes: PregeneratedPrimes,
     aux_info: Arc<Mutex<Option<Valid<DirtyAuxInfo>>>>,
 }
@@ -86,6 +95,7 @@ impl MpcService {
             network_channel_rx,
             protocol_event_channel_rx,
             active_channels_keygen: Arc::new(Mutex::new(HashMap::new())),
+            active_channels_signing: Arc::new(Mutex::new(HashMap::new())),
             active_channels_aux_info_gen: Arc::new(Mutex::new(HashMap::new())),
             pregenerated_primes,
             aux_info: Arc::new(Mutex::new(None)),
@@ -128,7 +138,7 @@ impl MpcService {
                             },
                             Ok(ProtocolEvents::JoinSigning { eid, shared_public_key, data }) => {
                                 tracing::info!("joining signing data={} with signer_id={} for eid={eid} and shared_public_key={shared_public_key} ...", hex::encode(&data), self.get_local_signer_id().await.unwrap());
-                               // TODO
+                                self.run_signing(eid, data, shared_public_key, false, None).await;
                             },
                             Ok(ProtocolEvents::Cggmp21CoreAuxInfoGen { eid, message_id, data, signer_id, receiver_signer_id }) => {
                                 let local_signer_id= self.get_local_signer_id().await.unwrap();
@@ -184,7 +194,31 @@ impl MpcService {
                                 });
                             },
                             Ok(ProtocolEvents::Cggmp21CoreSigning { eid, message_id, data, signer_id, receiver_signer_id }) => {
-                                // TODO
+                                let local_signer_id= self.get_local_signer_id().await.unwrap();
+                                let msg_type = if let Some(to_signer_id) = receiver_signer_id {
+                                    // TODO: be sure that the node knows the receiver_signer_id
+                                    if to_signer_id != local_signer_id {
+                                        continue;
+                                    }
+                                    MessageType::P2P
+                                } else {
+                                    MessageType::Broadcast
+                                };
+
+                                let active_channels_signing_locked = self.active_channels_signing.lock().await;
+                                let tx = active_channels_signing_locked.get(&eid).unwrap();
+
+                                let incoming = Incoming {
+                                    id: message_id,
+                                    sender: signer_id,
+                                    msg_type,
+                                    msg: bincode::deserialize::<SigningMessage<Secp256k1, Sha256>>(&data).unwrap()
+                                };
+
+                                tx.unbounded_send(Ok(incoming))
+                                .unwrap_or_else(|err| {
+                                    tracing::error!("failed to send the message into the cggmp21 mpc stream: {err}");
+                                });
                             },
                             Err(err) => {
                                 tracing::error!("failed to deserialize the protocol event {}. Reason: {err}", hex::encode(data));
@@ -207,7 +241,7 @@ impl MpcService {
                         Some(RpcCommands::StartSigning { response_tx, shared_public_key, data }) => {
                             let eid = MpcService::generate_eid();
                             tracing::info!("starting signing data={} with signer_id={} for eid={eid} and shared_public_key={shared_public_key} ...", hex::encode(&data),  self.get_local_signer_id().await.unwrap());
-                            // TODO
+                            self.run_signing(eid.clone(), data, shared_public_key, true, Some(response_tx)).await;
                         },
                         None => {
                             tracing::error!("invalid rpc command");
@@ -330,6 +364,81 @@ impl MpcService {
                 }
             }
         });
+    }
+
+    pub async fn run_signing(
+        &mut self,
+        eid: String,
+        data: Vec<u8>,
+        shared_public_key: String,
+        send_join_signing_event: bool,
+        rpc_response_tx: Option<Sender<Result<String, MpcServiceError>>>,
+    ) {
+        // NOTE: To sign using a 2-out-of-3 scheme, the signers MUST be 0 and 1.
+        // For example, if you need a 3-out-of-5 signature, the signers MUST be 0, 1, and 2.
+        // https://github.com/LFDT-Lockness/cggmp21/blob/5e621acd25aa492941ef9c4491a1c7aa16a39807/cggmp21/src/signing.rs#L546
+        // At the moment we force all participants to join the signature process.
+        let network_channel_tx = self.network_channel_tx.clone();
+        let active_channels_signing = Arc::clone(&self.active_channels_signing);
+        let local_signer_id = self.get_local_signer_id().await.unwrap();
+        let (response_tx, response_rx) = oneshot::channel::<String>(); // Valid<DirtyAuxInfo> doesn't implement debug so it doesn't work
+
+        // NOTE: get the key share corresponding to the shared public key provided
+        if let Some(key_share) = DB.lock().await.get(&shared_public_key).cloned() {
+            tokio::spawn(async move {
+                match run_signing(
+                    network_channel_tx,
+                    response_tx,
+                    send_join_signing_event,
+                    eid.clone(),
+                    data,
+                    local_signer_id,
+                    key_share,
+                    vec![0, 1, 2],
+                )
+                .await
+                {
+                    Ok(tx_0) => {
+                        let mut map_guard = active_channels_signing.lock().await;
+                        map_guard.insert(eid, tx_0);
+                    }
+                    Err(err) => {
+                        tracing::error!("error during signature generation. reason: {err}");
+                        // TODO
+                        /*if let Some(rpc_response_tx) = rpc_response_tx {
+                            rpc_response_tx
+                                .send(Err(MpcServiceError::KeyShareNotFound(
+                                    shared_public_key.clone(),
+                                )))
+                                .unwrap();
+                        }*/
+                    }
+                }
+            });
+
+            tokio::spawn(async move {
+                match response_rx.await {
+                    Ok(serialized_signature) => {
+                        // NOTE: if run_keygen has been called from RPC, we need to return the result
+                        if let Some(rpc_response_tx) = rpc_response_tx {
+                            rpc_response_tx.send(Ok(serialized_signature)).unwrap();
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("failed to read the signature. reason: {err}");
+                    }
+                }
+            });
+        } else {
+            tracing::error!("key share not found for shared_public_key={shared_public_key}");
+            if let Some(rpc_response_tx) = rpc_response_tx {
+                rpc_response_tx
+                    .send(Err(MpcServiceError::KeyShareNotFound(
+                        shared_public_key.clone(),
+                    )))
+                    .unwrap();
+            }
+        }
     }
 
     fn generate_eid() -> String {
