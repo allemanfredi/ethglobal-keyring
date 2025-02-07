@@ -21,6 +21,7 @@ const config: HardhatUserConfig = {
   etherscan: {
     apiKey: {
       sepolia: process.env.ETHERSCAN_API_KEY || "",
+      xdai: process.env.GNOSISSCAN_API_KEY || "",
     },
   },
   gasReporter: {
@@ -36,6 +37,12 @@ const config: HardhatUserConfig = {
       chainId: 11155111,
       url: process.env.SEPOLIA_JSON_RPC_URL,
       gasPrice: 120e9,
+    },
+    gnosis: {
+      accounts: [privateKey as string],
+      chainId: 100,
+      url: process.env.GNOSIS_JSON_RPC_URL,
+      gasPrice: 5e9,
     },
   },
   paths: {

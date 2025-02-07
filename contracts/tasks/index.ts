@@ -1,2 +1,24 @@
 import { task } from "hardhat/config"
-import type { TaskArguments } from "hardhat/types"
+
+task("KeyringGateway:deploy", "deploy Keyring Gateway").setAction(async (taskArgs, { ethers, upgrades }) => {
+  const [signer] = await ethers.getSigners()
+  const KeyringGateway = await ethers.getContractFactory("KeyringGateway")
+  const keyringGateway = await upgrades.deployProxy(KeyringGateway, [signer.address])
+  await keyringGateway.waitForDeployment()
+  console.log("KeyringGateway deployed to:", await keyringGateway.getAddress())
+})
+
+task("KeyringSafeModule:deploy", "deploy Keyring Gateway")
+  .addParam("gateway", "Keyring Gateway")
+  .addParam("safe", "The safe to which this module is attached")
+  .setAction(async (taskArgs, { ethers, upgrades }) => {
+    const [signer] = await ethers.getSigners()
+    const KeyringSafeModule = await ethers.getContractFactory("KeyringSafeModule")
+    const keyringSafeModule = await upgrades.deployProxy(KeyringSafeModule, [
+      signer.address,
+      taskArgs.gateway,
+      taskArgs.safe,
+    ])
+    await keyringSafeModule.waitForDeployment()
+    console.log("KeyringSafeModule deployed to:", await keyringSafeModule.getAddress())
+  })
