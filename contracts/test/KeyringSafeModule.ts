@@ -25,6 +25,7 @@ describe("KeyringSafeModule", () => {
   let abiCoder = new AbiCoder()
   let owner: SignerWithAddress
   let user1: SignerWithAddress
+  let signer: SignerWithAddress
 
   describe("executeOperation", function () {
     this.beforeEach(async () => {
@@ -32,6 +33,7 @@ describe("KeyringSafeModule", () => {
       const signers = await ethers.getSigners()
       owner = signers[0]
       user1 = signers[1]
+      signer = signers[2]
       const proxy1 = await upgrades.deployProxy(KeyringGateway, [owner.address])
       await proxy1.waitForDeployment()
       gateway = (await KeyringGateway.attach(await proxy1.getAddress())) as KeyringGateway
@@ -52,6 +54,7 @@ describe("KeyringSafeModule", () => {
         owner.address,
         await gateway.getAddress(),
         await safe.getAddress(),
+        signer.address,
       ])
       await proxy2.waitForDeployment()
       module = (await KeyringSafeModule.attach(await proxy2.getAddress())) as KeyringSafeModule
@@ -99,7 +102,7 @@ describe("KeyringSafeModule", () => {
       await gateway.enableSigner(node.wallet.address)
       await expect(gateway.executeOperation(operation.serialize(), signedOperation)).to.emit(
         gateway,
-        "OperationExecuted",
+        "KeyringOperationExecuted",
       )
       const user1Balance = await token.balanceOf(user1.address)
       expect(user1Balance).to.be.eq(amountToTransfer)

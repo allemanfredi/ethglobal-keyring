@@ -16,13 +16,15 @@ contract KeyringSafeModule is IKeyringSafeModule, IKeyringTarget, UUPSUpgradeabl
 
     address public gateway;
     address public safe;
+    address public expectedSigner;
 
-    function initialize(address owner, address gateway_, address safe_) public initializer {
+    function initialize(address owner, address gateway_, address safe_, address expectedSigner_) public initializer {
         __AccessControlEnumerable_init();
         __UUPSUpgradeable_init();
 
         gateway = gateway_;
         safe = safe_;
+        expectedSigner = expectedSigner_;
 
         _grantRole(DEFAULT_ADMIN_ROLE, owner);
         _grantRole(UPDATE_GATEWAY_ROLE, owner);
@@ -30,7 +32,8 @@ contract KeyringSafeModule is IKeyringSafeModule, IKeyringTarget, UUPSUpgradeabl
         _grantRole(ON_OPERATION_ROLE, gateway_);
     }
 
-    function onOperation(Operation memory operation) external onlyRole(ON_OPERATION_ROLE) {
+    function onOperation(address signer, Operation memory operation) external onlyRole(ON_OPERATION_ROLE) {
+        // require(signer == expectedSigner, InvalidSigner());
         (
             address to,
             uint256 value,

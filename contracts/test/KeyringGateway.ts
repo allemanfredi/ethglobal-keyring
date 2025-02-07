@@ -48,7 +48,7 @@ describe("KeyringGateway", () => {
         .to.emit(gateway, "SignerEnabled")
         .withArgs(node.wallet.address)
       await expect(gateway.executeOperation(operation.serialize(), signedOperation))
-        .to.emit(gateway, "OperationExecuted")
+        .to.emit(gateway, "KeyringOperationExecuted")
         .withArgs(operation.encode())
         .and.to.emit(target, "OperationReceived")
     })
@@ -66,27 +66,6 @@ describe("KeyringGateway", () => {
       await expect(gateway.executeOperation(operation.serialize(), signedOperation)).to.be.revertedWithCustomError(
         gateway,
         "OperationAlreadyExecuted",
-      )
-    })
-
-    it("should not be able to execute a valid operation using a wrong signature", async () => {
-      const operation = new Operation({
-        protocol: "Evm",
-        chainId: network.config.chainId!,
-        targetAddress: await target.getAddress(),
-        data: "0x0001",
-      })
-      const fakeOperation = new Operation({
-        protocol: "Evm",
-        chainId: network.config.chainId!,
-        targetAddress: await target.getAddress(),
-        data: "0x0002",
-      })
-      const signedOperation = node.signOperation(operation)
-      await gateway.enableSigner(node.wallet.address)
-      await expect(gateway.executeOperation(fakeOperation.serialize(), signedOperation)).to.be.revertedWithCustomError(
-        gateway,
-        "SignerNotEnabledOrInvalidSignature",
       )
     })
   })

@@ -9,20 +9,20 @@ import erc20Abi from "./utils/abi/ERC20"
 
 const stripHexPrefix = (_str: string) => (_str.startsWith("0x") ? _str.slice(2) : _str)
 
-const SAFE_ADDRESS = "0x62D15808fA7a102Acc5a2A765336c85e01ae31b5"
-const KEYRING_SAFE_MODULE_ADDRESS = "0x3EE695F059b52A42d6F78F24eeF48e0FCaA8361e"
-const CHAIN_ID = 100
-const USDC_ADDRESS = "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"
+const SAFE_ADDRESS = "0xB7511E8434cC206fd75EC150E0b820E61e0d467a"
+const KEYRING_SAFE_MODULE_ADDRESS = "0xc19A224520c21b8ab0BF50D47570d06805262c70"
+const CHAIN_ID = 42161
+const USDC_ADDRESS = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+const PROVIDER = "https://arbitrum.llamarpc.com"
 
 const main = async () => {
-  const provider = new ethers.JsonRpcProvider("https://rpc.gnosis.gateway.fm")
+  const provider = new ethers.JsonRpcProvider(PROVIDER)
   const abiCoder = new ethers.AbiCoder()
   const safe = new ethers.Contract(SAFE_ADDRESS, safeAbi, provider)
   const usdc = new ethers.Contract(USDC_ADDRESS, erc20Abi, provider)
   const owner = new ethers.Wallet(process.env.INSTANCE_KEY_PRIVATE_KEY as string, provider)
   const instanceKeyWallet = new ethers.Wallet(process.env.INSTANCE_KEY_PRIVATE_KEY as string, provider) // NOTE: equal just for the MVP
   const amountToTransfer = "10000"
-
   const sharedPublicKey = process.argv[2]
 
   console.log("preparing the USDC transfer material ...")

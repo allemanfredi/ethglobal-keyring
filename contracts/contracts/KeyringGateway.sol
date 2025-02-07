@@ -24,29 +24,22 @@ contract KeyringGateway is IKeyringGateway, UUPSUpgradeable, AccessControlEnumer
         return _executedOperations[sha256(operation)];
     }
 
-    function enableSigner(address signer) external {
-        // TODO
-        _enabledSigners[signer] = true;
-        emit SignerEnabled(signer);
-    }
-
     function executeOperation(bytes calldata operation, bytes calldata signature) external {
         bytes32 operationHash = sha256(operation);
         require(!_executedOperations[operationHash], OperationAlreadyExecuted());
         _executedOperations[operationHash] = true;
 
         address signer = ECDSA.recover(operationHash, signature);
-        require(_enabledSigners[signer], SignerNotEnabledOrInvalidSignature());
 
         Operation memory op = operation.decode();
         require(op.protocol == Protocol.Evm, InvalidProtocol());
         require(op.chainId == block.chainid, InvalidChainId());
 
-        try IKeyringTarget(op.target).onOperation(op) {} catch {
+        try IKeyringTarget(op.target).onOperation(signer, op) {} catch {
             revert OnOperationFailed();
         }
 
-        emit OperationExecuted(op);
+        emit KeyringOperationExecuted(op);
     }
 
     function _authorizeUpgrade(address) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
