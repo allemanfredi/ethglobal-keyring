@@ -1,4 +1,4 @@
-### **📜 Keyring - The Decentralized KMS for AI Agents**
+# Keyring - The Decentralized KMS for AI Agents**
 
 Keyring is a **decentralized key management system (KMS)** built to empower **AI agents** interacting with funds while ensuring **security and decentralization**. By leveraging **EigenLayer**, Keyring introduces additional **security mechanisms**, particularly for **slashing operators** who perform unauthorized operations. 
 
