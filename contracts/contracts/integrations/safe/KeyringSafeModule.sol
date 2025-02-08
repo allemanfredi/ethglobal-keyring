@@ -33,7 +33,7 @@ contract KeyringSafeModule is IKeyringSafeModule, IKeyringTarget, UUPSUpgradeabl
     }
 
     function onOperation(address signer, Operation memory operation) external onlyRole(ON_OPERATION_ROLE) {
-        // require(signer == expectedSigner, InvalidSigner());
+        require(signer == expectedSigner, InvalidSigner());
         (
             address to,
             uint256 value,
