@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "prettier:write": "prettier --write \"**/*.{js,json,md,sol,ts,yml}\""
+    "prettier:write": "prettier --write \"**/*.{js,json,md,sol,ts,yml}\"",
+    "agent::initialize": "npx ts-node src/initialize.ts",
+    "agent::transfer-usdc": "npx ts-node src/transfer-usdc.ts"
   },
   "author": "",
   "license": "ISC",
