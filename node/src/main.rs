@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate lazy_static;
 
+mod eigen_layer;
 mod mpc;
 mod p2p;
 mod rpc;
@@ -15,6 +16,7 @@ use std::{
 
 use anyhow::Result;
 use cggmp21::PregeneratedPrimes;
+// use eigen_layer::{EigenLayerService, EigenLayerServiceConfig};
 use futures::{self, channel::mpsc::unbounded};
 use mpc::mpc_service::MpcService;
 use p2p::network_service::NetworkService;
